@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""typehere - type text at the cursor, in whatever app currently has focus.
+
+Events are injected through the kernel's uinput layer (ydotool), which sits
+below the Wayland compositor. That is why this works in any app - native
+Wayland, XWayland or X11 - without needing to know anything about windows.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from collections import Counter
+
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SOCKET_PATH = os.environ.get("YDOTOOL_SOCKET") or os.path.join(
+    RUNTIME_DIR, ".ydotool_socket"
+)
+
+# linux/input-event-codes.h
+KEY_LEFTCTRL = 29
+KEY_V = 47
+KEY_LEFTSHIFT = 42
+KEY_ENTER = 28
+KEY_BACKSPACE = 14
+
+
+def die(message: str) -> None:
+    print(f"typehere: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def have(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def socket_alive() -> bool:
+    """Connecting is the only reliable liveness check for ydotoold.
+
+    ydotoold binds an AF_UNIX *datagram* socket, so the client must use the
+    same type - SOCK_STREAM fails with EPROTOTYPE (errno 91).
+    """
+    if not os.path.exists(SOCKET_PATH):
+        return False
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(1.0)
+        try:
+            sock.connect(SOCKET_PATH)
+            return True
+        except OSError:
+            return False
+
+
+def ensure_daemon() -> None:
+    if socket_alive():
+        return
+    if not have("ydotoold"):
+        die("ydotoold not found - install the ydotool package")
+    if not os.access("/dev/uinput", os.W_OK):
+        die(
+            "no write access to /dev/uinput.\n"
+            "  Run:  sudo setfacl -m u:$USER:rw /dev/uinput\n"
+            "  or:   sudo usermod -aG input $USER   (then log out and back in)"
+        )
+    subprocess.Popen(
+        ["ydotoold", "-p", SOCKET_PATH, "-P", "0600"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    for _ in range(50):
+        time.sleep(0.1)
+        if socket_alive():
+            return
+    die("ydotoold did not come up - run 'ydotoold' in a terminal to see why")
+
+
+def send_keycodes(keycodes: list[str], key_delay: int) -> None:
+    command = ["ydotool", "key"]
+    if key_delay:
+        command += ["-d", str(key_delay)]
+    subprocess.run(command + keycodes, check=True)
+
+
+def send_shift_enter(key_delay: int) -> None:
+    """Type a newline as Shift+Enter, which many editors do not auto-indent."""
+    send_keycodes(
+        [
+            f"{KEY_LEFTSHIFT}:1",
+            f"{KEY_ENTER}:1",
+            f"{KEY_ENTER}:0",
+            f"{KEY_LEFTSHIFT}:0",
+        ],
+        key_delay,
+    )
+
+
+def send_backspaces(count: int, key_delay: int) -> None:
+    """Send ``count`` backspace key events in one ydotool call."""
+    if count <= 0:
+        return
+
+    keycodes: list[str] = []
+    for _ in range(count):
+        keycodes.extend((f"{KEY_BACKSPACE}:1", f"{KEY_BACKSPACE}:0"))
+
+    command = ["ydotool", "key"]
+    if key_delay:
+        command += ["-d", str(key_delay)]
+    subprocess.run(command + keycodes, check=True)
+
+
+def looks_like_code(text: str) -> bool:
+    """Best-effort heuristic for whether ``text`` is source code.
+
+    This only has to be good enough to choose an indentation strategy. It is
+    intentionally conservative so ordinary prose is left alone.
+    """
+    if not text.strip():
+        return False
+
+    first_line = text.lstrip().splitlines()[0] if text.splitlines() else ""
+    if first_line.startswith("#!") and re.search(
+        r"\b(?:python|bash|sh|zsh|node|ruby|perl|php)\b", first_line, re.IGNORECASE
+    ):
+        return True
+
+    code_keyword = re.compile(
+        r"\b(?:def|class|if|elif|else|for|while|return|import|from|try|except|"
+        r"finally|with|async|await|function|const|let|var|public|private|"
+        r"protected|static|interface|struct|namespace|using|include|switch|"
+        r"case|break|continue|new|throw|catch)\b",
+        re.IGNORECASE,
+    )
+    block_keyword = re.compile(
+        r"\b(?:def|function|class|if|for|while|switch|with|else|elif|try|"
+        r"except|finally)\b",
+        re.IGNORECASE,
+    )
+
+    score = 0
+    if code_keyword.search(text):
+        score += 4
+    if re.search(r"[{};]", text):
+        score += 3
+    if re.search(r"(?m)^[ \t]+", text):
+        score += 2
+    if re.search(r"(?m):[ \t]*(?:#.*)?$", text):
+        score += 2
+    if re.search(r"(?m)(?:\{|\[|\()\s*$", text):
+        score += 3
+    if block_keyword.search(text):
+        score += 1
+
+    return score >= 5
+
+
+def detect_indent_width(text: str) -> int:
+    """Return the indentation step as a number of keyboard columns.
+
+    For tab-indented input one backspace removes one tab, so the step is 1.
+    For space-indented input the most common positive indentation delta is
+    used, falling back to four spaces.
+    """
+    lines = text.splitlines()
+    if any(line[: len(line) - len(line.lstrip())].count("\t") for line in lines):
+        return 1
+
+    deltas: list[int] = []
+    previous: int | None = None
+    for line in lines:
+        if not line.strip():
+            continue
+        current = len(line) - len(line.lstrip(" "))
+        if previous is not None and current > previous:
+            deltas.append(current - previous)
+        previous = current
+
+    counts = Counter(delta for delta in deltas if 1 <= delta <= 8)
+    return counts.most_common(1)[0][0] if counts else 4
+
+
+def leading_columns(line: str) -> int:
+    """Count leading whitespace columns; a tab counts as one backspace."""
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def estimate_auto_indent(previous_line: str, indent_width: int) -> int:
+    """Estimate how many columns an editor auto-indents after ``previous_line``.
+
+    Most editors keep the previous line's indentation and add one indent step
+    when the line opens a block (``:`` or ``{``). We send that many backspaces
+    before typing the next line, so the line's own leading whitespace is what
+    remains.
+    """
+    stripped = previous_line.rstrip()
+    if not stripped:
+        return 0
+
+    base = leading_columns(previous_line)
+    if stripped.endswith((":", "{", "(", "[")):
+        return base + indent_width
+    return base
+
+
+def type_code_with_backspace(text: str, key_delay: int, indent_width: int) -> None:
+    """Type code line-by-line, backspacing over each editor auto-indent."""
+    lines = text.split("\n")
+    previous_nonblank: str | None = None
+
+    for index, line in enumerate(lines):
+        if previous_nonblank is not None and (line or index < len(lines) - 1):
+            send_backspaces(
+                estimate_auto_indent(previous_nonblank, indent_width),
+                key_delay,
+            )
+
+        if line:
+            result = subprocess.run(
+                ["ydotool", "type", "-d", str(key_delay), "-H", "0", "-f", "-"],
+                input=line.encode("utf-8"),
+            )
+            if result.returncode != 0:
+                die("ydotool failed to type the text")
+
+        if index < len(lines) - 1:
+            send_keycodes(
+                [f"{KEY_ENTER}:1", f"{KEY_ENTER}:0"],
+                key_delay,
+            )
+
+        if line.strip():
+            previous_nonblank = line
+
+
+def type_as_keycodes(text: str, key_delay: int, shift_enter: bool = False) -> None:
+    """Send real key events. Fast, and leaves the clipboard alone."""
+    # Override ydotool's 20 ms default hold; key_delay controls typing pace.
+    if not shift_enter:
+        result = subprocess.run(
+            ["ydotool", "type", "-d", str(key_delay), "-H", "0", "-f", "-"],
+            input=text.encode("utf-8"),
+        )
+        if result.returncode != 0:
+            die("ydotool failed to type the text")
+        return
+
+    # Type each line's contents with ydotool, and use Shift+Enter for the
+    # newlines so code editors do not add their own auto-indentation on top of
+    # the leading spaces we already send.
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line:
+            result = subprocess.run(
+                ["ydotool", "type", "-d", str(key_delay), "-H", "0", "-f", "-"],
+                input=line.encode("utf-8"),
+            )
+            if result.returncode != 0:
+                die("ydotool failed to type the text")
+        if index < len(lines) - 1:
+            send_shift_enter(key_delay)
+
+
+def type_as_keycodes_with_auto_code(
+    text: str, key_delay: int, indent_width: int | None = None
+) -> None:
+    """Automatically protect code indentation with Shift+Enter.
+
+    Shift+Enter prevents most editors from adding their own indent, so the
+    explicit leading whitespace in the text is all that remains. Unlike
+    backspacing, this is safe even when the target has auto-indent disabled.
+    """
+    if looks_like_code(text):
+        type_as_keycodes(text, key_delay, shift_enter=True)
+        return
+
+    type_as_keycodes(text, key_delay)
+
+
+def type_as_keycodes_with_backspace(
+    text: str, key_delay: int, indent_width: int | None = None
+) -> None:
+    """Optional backspace correction for editors that are known to auto-indent."""
+    if looks_like_code(text):
+        type_code_with_backspace(
+            text,
+            key_delay,
+            indent_width if indent_width is not None else detect_indent_width(text),
+        )
+        return
+
+    type_as_keycodes(text, key_delay)
+
+
+def read_clipboard() -> str:
+    if not have("wl-paste"):
+        die("reading the clipboard needs wl-paste (package: wl-clipboard)")
+    result = subprocess.run(["wl-paste", "--no-newline"], capture_output=True)
+    if result.returncode != 0:
+        die("could not read the clipboard")
+    return result.stdout.decode("utf-8", "replace")
+
+
+def type_as_paste(text: str, key_delay: int, restore: bool) -> None:
+    """Put the text on the clipboard and press Ctrl+V.
+
+    Slower and briefly replaces your clipboard, but handles any Unicode the
+    keycode table does not know about.
+    """
+    if not have("wl-copy"):
+        die("pasting needs wl-copy (package: wl-clipboard)")
+
+    previous = None
+    if restore:
+        saved = subprocess.run(["wl-paste", "--no-newline"], capture_output=True)
+        if saved.returncode == 0 and saved.stdout:
+            previous = saved.stdout
+
+    subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True)
+    time.sleep(0.15)
+    send_keycodes(
+        [f"{KEY_LEFTCTRL}:1", f"{KEY_V}:1", f"{KEY_V}:0", f"{KEY_LEFTCTRL}:0"],
+        key_delay,
+    )
+
+    if previous is not None:
+        time.sleep(0.6)
+        subprocess.run(["wl-copy"], input=previous, check=False)
+
+
+def read_file(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as error:
+        die(f"cannot read {path}: {error.strerror}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="typehere",
+        description="Type text at the cursor, in whatever app has focus.",
+    )
+    parser.add_argument("text", nargs="*", help="text to type")
+    parser.add_argument("-f", "--file", metavar="PATH", help="read text from a file ('-' for stdin)")
+    parser.add_argument("--stdin", action="store_true", help="read the text to type from stdin")
+    parser.add_argument("-c", "--clipboard", action="store_true", help="type the current clipboard contents")
+    parser.add_argument(
+        "-p",
+        "--paste",
+        action="store_true",
+        help="type by pasting (Ctrl+V) instead of key events; slower but handles any Unicode",
+    )
+    parser.add_argument(
+        "-w",
+        "--wait",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="wait first, so you can focus the target field (default: 0)",
+    )
+    parser.add_argument(
+        "-d",
+        "--key-delay",
+        type=int,
+        default=1,
+        metavar="MS",
+        help="delay between key events, in milliseconds (default: 1)",
+    )
+    parser.add_argument(
+        "--no-restore-clipboard",
+        action="store_true",
+        help="with --paste, leave the typed text in the clipboard",
+    )
+    parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="never switch to --paste automatically; drop characters a US keyboard cannot produce",
+    )
+    parser.add_argument(
+        "--shift-enter",
+        action="store_true",
+        help="type newlines as Shift+Enter, so editors do not auto-indent typed code",
+    )
+    parser.add_argument(
+        "--auto-code",
+        "--auto-indent",
+        dest="auto_code",
+        action="store_true",
+        help="detect source code and use Shift+Enter so editor auto-indent "
+        "does not double the typed indentation (enabled by default)",
+    )
+    parser.add_argument(
+        "--no-auto-code",
+        dest="auto_code",
+        action="store_false",
+        help="never detect code; type key events exactly as provided",
+    )
+    parser.add_argument(
+        "--backspace-indent",
+        action="store_true",
+        help="for code, backspace over editor auto-indent instead of using "
+        "Shift+Enter; only use this in editors that reliably auto-indent",
+    )
+    parser.add_argument(
+        "--indent-width",
+        type=int,
+        default=None,
+        metavar="COLUMNS",
+        help="backspace columns per indent level for --backspace-indent "
+        "(default: detect from the text, then 4)",
+    )
+    parser.set_defaults(auto_code=True)
+    return parser.parse_args()
+
+
+def resolve_text(args: argparse.Namespace) -> str:
+    if args.file is not None:
+        return read_file(args.file)
+    if args.clipboard:
+        return read_clipboard()
+    if args.text and not args.stdin:
+        return " ".join(args.text)
+    return sys.stdin.read()
+
+
+def main() -> None:
+    args = parse_args()
+    text = resolve_text(args)
+    if not text:
+        die("nothing to type")
+
+    if not text.isascii() and not args.paste:
+        if args.no_fallback:
+            print(
+                "typehere: note - non-ASCII text; characters a US keyboard cannot "
+                "produce will be dropped",
+                file=sys.stderr,
+            )
+        else:
+            # Keycode mode would silently mangle accents and emoji, so paste instead.
+            print(
+                "typehere: non-ASCII text - using paste mode "
+                "(--no-fallback to disable)",
+                file=sys.stderr,
+            )
+            args.paste = True
+
+    ensure_daemon()
+    if args.wait > 0:
+        time.sleep(args.wait)
+
+    if args.paste:
+        type_as_paste(text, args.key_delay, restore=not args.no_restore_clipboard)
+    elif args.backspace_indent:
+        type_as_keycodes_with_backspace(text, args.key_delay, args.indent_width)
+    elif args.shift_enter:
+        type_as_keycodes(text, args.key_delay, shift_enter=True)
+    elif not args.auto_code:
+        type_as_keycodes(text, args.key_delay)
+    else:
+        type_as_keycodes_with_auto_code(text, args.key_delay, args.indent_width)
+
+
+if __name__ == "__main__":
+    main()
